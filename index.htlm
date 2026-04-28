@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGPU SPH Fluid – Optimised</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #eee; font-family: sans-serif; }
+        #ui  { position: absolute; top: 10px; left: 10px; z-index: 10;
+               background: rgba(0,0,0,0.75); padding: 15px; border-radius: 8px; max-width: 520px; }
+        button { padding: 10px 15px; margin: 4px 4px 4px 0; cursor: pointer;
+                 background: #333; color: white; border: 1px solid #555; border-radius: 4px; }
+        button:hover { background: #555; }
+        #stats { margin-top: 12px; font-family: monospace; font-size: 12px; white-space: pre; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<div id="ui">
+    <label for="steps-input" style="font-size:14px;">Steps/Frame:</label>
+    <input type="number" id="steps-input" value="5" min="1" max="200"
+        style="width:55px; margin:0 14px 0 5px; background:#333; color:white;
+               border:1px solid #555; border-radius:4px; padding:8px 5px;">
+    <button id="btn-low">Low (16k, 32³)</button>
+    <button id="btn-high">High (65k, 32³)</button>
+    <button id="btn-low-small">Low Small (16k, 16³)</button>
+    <button id="btn-render">Start Render</button>
+    <button id="btn-headless">Start Benchmark</button>
+    <div id="stats">Awaiting start…</div>
+</div>
+<canvas id="glcanvas"></canvas>
+
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0.  TOP-LEVEL GLOBALS
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas   = document.getElementById('glcanvas');
+canvas.width   = window.innerWidth;
+canvas.height  = window.innerHeight;
+const statsDiv = document.getElementById('stats');
+
+// Relay errors to the UI overlay so they're visible on mobile / headless runs
+const _CE = console.error.bind(console);
+console.error = (...a) => {
+    _CE(...a);
+    const msg = a.map(x => (x && x.message) ? x.message
+                           : (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+    statsDiv.innerText += '\n[ERR] ' + msg;
+};
+
+let device, gpuCtx, canvasFmt, hasTimestamps;
+let isPipelineBuilt = false;
+let simMode         = 'low';   // 'low' | 'high' | 'low_small'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1.  WEBGPU DEVICE INITIALISATION
+// ─────────────────────────────────────────────────────────────────────────────
+async function initWebGPU() {
+    if (!navigator.gpu) throw new Error('WebGPU not supported in this browser.');
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) throw new Error('No WebGPU adapter found.');
+
+    hasTimestamps = adapter.features.has('timestamp-query');
+
+    device = await adapter.requestDevice({
+        requiredFeatures: hasTimestamps ? ['timestamp-query'] : [],
+    });
+    device.addEventListener('uncapturederror', ev =>
+        console.error('WebGPU uncaptured:', ev.error.message ?? ev.error));
+
+    canvasFmt = navigator.gpu.getPreferredCanvasFormat();
+    gpuCtx    = canvas.getContext('webgpu');
+    gpuCtx.configure({ device, format: canvasFmt, alphaMode: 'opaque' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2.  MAIN PIPELINE + SIMULATION BUILDER
+// ─────────────────────────────────────────────────────────────────────────────
+async function buildPipelineAndStart(isRenderMode) {
+    if (isPipelineBuilt) return;
+    isPipelineBuilt = true;
+    statsDiv.innerText = 'Initialising WebGPU…';
+
+    await initWebGPU();
+
+    // ── 2.1  Simulation constants ─────────────────────────────────────────────
+    const IS_HIGH       = simMode === 'high';
+    const IS_SMALL      = simMode === 'low_small';
+
+    const TW            = IS_HIGH ? 256 : 128;          // texture/buffer grid width
+    const TH            = IS_HIGH ? 256 : 128;          // texture/buffer grid height
+    const N             = TW * TH;                       // total particles
+
+    const WORLD         = IS_SMALL ? 16  : 32;           // world side length
+    const WORLD_MAX     = WORLD - 1;
+    const WORLD_BOUND   = WORLD - 0.01;
+    const Z_MULT        = WORLD * WORLD;                  // stride for Z in cell index
+
+    const GW            = IS_SMALL ? 64  : 256;          // grid texture width
+    const GH            = IS_SMALL ? 64  : 128;          // grid texture height
+    const NCELLS        = GW * GH;                        // total grid cells
+
+    // Workgroup sizes — tuned for occupancy across desktop & mobile GPUs
+    const WGP           = 256;   // particle dispatches
+    const WGC           = 256;   // cell dispatches  (prefix-sum phase 1 MUST equal WGS)
+    const WGS           = 256;   // prefix-sum workgroup size (power of 2)
+    const NBLOCKS       = Math.ceil(NCELLS / WGS);        // scan blocks (≤ 128 for our sizes)
+
+    // String constants injected into WGSL at build time
+    const sN    = `${N}u`;
+    const sNC   = `${NCELLS}u`;
+    const sWB   = WORLD_BOUND.toFixed(2);
+    const sWM   = WORLD_MAX.toString();
+    const sW    = `${WORLD}u`;
+    const sZM   = `${Z_MULT}u`;
+    const sHW   = (WORLD / 2).toFixed(1);
+    const sWGP  = `${WGP}`;
+    const sWGS  = `${WGS}`;
+    const sNBLK = `${NBLOCKS}u`;
+
+    // ── 2.2  Buffer helpers ───────────────────────────────────────────────────
+    const U = GPUBufferUsage;
+    const RWCS = U.STORAGE | U.COPY_SRC | U.COPY_DST;
+    const UNI  = U.UNIFORM  | U.COPY_DST;
+
+    function mkBuf(label, bytes, usage, init) {
+        const b = device.createBuffer({ label, size: Math.max(bytes, 16), usage });
+        if (init) device.queue.writeBuffer(b, 0, init);
+        return b;
+    }
+    const P16  = N      * 16;   // particle buffer bytes  (vec4f × N)
+    const C16  = NCELLS * 16;   // cell buffer bytes      (vec4f × NCELLS)
+    const C4   = NCELLS * 4;    // cell buffer bytes      (u32   × NCELLS)
+    const BLK4 = Math.max(NBLOCKS, WGS) * 4; // block-sum buffer bytes
+
+    // ── 2.3  Initial particle data ────────────────────────────────────────────
+    const initPos = new Float32Array(N * 4);
+    const initVel = new Float32Array(N * 4); // all zero
+    for (let i = 0; i < N; i++) {
+        initPos[i*4+0] = Math.random() * (WORLD / 2);  // dam-break start
+        initPos[i*4+1] = Math.random() *  WORLD;
+        initPos[i*4+2] = Math.random() *  WORLD;
+        initPos[i*4+3] = i;                              // carry original ID
+    }
+
+    // ── 2.4  GPU Buffers ─────────────────────────────────────────────────────
+    // Simulation state (ping-pong)
+    const posBufA   = mkBuf('posA',    P16,  RWCS, initPos);
+    const posBufB   = mkBuf('posB',    P16,  RWCS, null);
+    const velBufA   = mkBuf('velA',    P16,  RWCS, initVel);
+    const velBufB   = mkBuf('velB',    P16,  RWCS, null);
+
+    // Counting-sort infrastructure
+    const hashBuf   = mkBuf('hash',    P16,  RWCS, null); // (cellId, origId,  0, 0) unsorted
+    const countBuf  = mkBuf('count',   C4,   RWCS, null); // atomic u32  per cell
+    const prefixBuf = mkBuf('prefix',  C4,   RWCS, null); // exclusive prefix-sum
+    const offsetBuf = mkBuf('offset',  C4,   RWCS, null); // write-cursor for scatter (copy of prefix)
+    const blockBuf  = mkBuf('blocks',  BLK4, RWCS, null); // block sums for phase-2 scan
+    const sortedBuf = mkBuf('sorted',  P16,  RWCS, null); // (pos.xyz, origId)  sorted by cell
+    const gridBuf   = mkBuf('grid',    C16,  RWCS, null); // (startIdx, count,  0, 0) per cell
+
+    // Physics
+    const densityBuf= mkBuf('dens',    P16,  RWCS, null); // (density, 0, 0, 0)
+
+    // Render & utility
+    const aspectBuf = mkBuf('aspect',  16,   UNI,
+        new Float32Array([canvas.width / canvas.height, 0, 0, 0]));
+    const syncBuf   = device.createBuffer({
+        label: 'sync', size: 256, usage: U.COPY_DST | U.MAP_READ });
+    const depthTex  = device.createTexture({
+        label:'depth', size:[canvas.width, canvas.height, 1],
+        format:'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+
+    // Optional timestamp query infrastructure
+    let tsQuerySet, tsResolveBuf, tsReadBuf;
+    if (hasTimestamps) {
+        tsQuerySet  = device.createQuerySet({ type:'timestamp', count:2 });
+        tsResolveBuf= mkBuf('ts-resolve', 16, U.QUERY_RESOLVE | U.COPY_SRC | U.COPY_DST, null);
+        tsReadBuf   = device.createBuffer({ label:'ts-read', size:16,
+            usage: U.COPY_DST | U.MAP_READ });
+    }
+
+    // ── 2.5  Ping-pong state ──────────────────────────────────────────────────
+    let readState  = { pos: posBufA, vel: velBufA };
+    let writeState = { pos: posBufB, vel: velBufB };
+    function swapPingPong() { [readState, writeState] = [writeState, readState]; }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3.  WGSL SHADER SOURCES
+    //     All injected constants are capitalised for clarity.
+    //     Every shader uses @compute @workgroup_size(WGP/WGS/WGC).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── 3.1  HASH + ATOMIC COUNT (merged into one pass) ───────────────────────
+    //   • Reads current particle positions.
+    //   • Writes (cellId, origId) to hashBuf for the scatter stage.
+    //   • Atomically increments countBuf[cellId].
+    //   Merging these saves one full dispatch and one buffer read round-trip.
+    const HASH_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>            pos      : array<vec4f>;
+@group(0) @binding(1) var<storage, read_write>      hashOut  : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write>      counts   : array<atomic<u32>>;
+
+const WORLD_BOUND : f32 = ${sWB};
+const WORLD_U     : u32 = ${sW};
+const Z_MULT_U    : u32 = ${sZM};
+
+@compute @workgroup_size(${sWGP})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let id = gid.x;
+    if (id >= ${sN}) { return; }
+
+    let pd       = pos[id];
+    let p        = clamp(pd.xyz, vec3f(0.0), vec3f(WORLD_BOUND));
+    let cell3D   = vec3u(floor(p));
+    let cellId   = cell3D.x + cell3D.y * WORLD_U + cell3D.z * Z_MULT_U;
+
+    hashOut[id]  = vec4f(f32(cellId), pd.w, 0.0, 0.0);
+    atomicAdd(&counts[cellId], 1u);
+}
+`;
+
+    // ── 3.2  PREFIX-SUM PHASE 1 — local exclusive scan within workgroups ──────
+    //   Uses Kogge-Stone parallel scan with workgroup shared memory.
+    //   Produces:  prefixBuf[i]  = local exclusive sum within the workgroup block
+    //              blockBuf[wid] = total sum of the workgroup's block
+    const SCAN1_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>        cntIn    : array<u32>;
+@group(0) @binding(1) var<storage, read_write>  prefOut  : array<u32>;
+@group(0) @binding(2) var<storage, read_write>  blockOut : array<u32>;
+
+var<workgroup> smem : array<u32, ${sWGS}>;
+
+@compute @workgroup_size(${sWGS})
+fn cs_main(
+    @builtin(global_invocation_id) gid : vec3u,
+    @builtin(local_invocation_id)  lid : vec3u,
+    @builtin(workgroup_id)         wid : vec3u
+) {
+    let g = gid.x;
+    let l = lid.x;
+
+    smem[l] = select(0u, cntIn[g], g < ${sNC});
+    workgroupBarrier();
+
+    // Kogge-Stone inclusive scan (two barriers per stride to avoid RAW hazards)
+    for (var stride = 1u; stride < ${sWGS}u; stride <<= 1u) {
+        let v = smem[l] + select(0u, smem[l - stride], l >= stride);
+        workgroupBarrier();
+        smem[l] = v;
+        workgroupBarrier();
+    }
+
+    // Save the block's total (inclusive[last]) for phase-2
+    if (l == ${sWGS}u - 1u) { blockOut[wid.x] = smem[l]; }
+    workgroupBarrier();
+
+    // Convert inclusive → exclusive by reading left neighbour
+    let excl = select(0u, smem[l - 1u], l > 0u);
+    if (g < ${sNC}) { prefOut[g] = excl; }
+}
+`;
+
+    // ── 3.3  PREFIX-SUM PHASE 2 — single-workgroup scan of block sums ─────────
+    //   Fits in one workgroup because NBLOCKS ≤ 128 for all our grid sizes.
+    //   Overwrites blockBuf in-place with the exclusive prefix of block totals.
+    const SCAN2_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> blockBuf : array<u32>;
+
+var<workgroup> smem : array<u32, ${sWGS}>;
+
+@compute @workgroup_size(${sWGS})
+fn cs_main(
+    @builtin(local_invocation_id) lid : vec3u
+) {
+    let l = lid.x;
+    smem[l] = select(0u, blockBuf[l], l < ${sNBLK});
+    workgroupBarrier();
+
+    for (var stride = 1u; stride < ${sWGS}u; stride <<= 1u) {
+        let v = smem[l] + select(0u, smem[l - stride], l >= stride);
+        workgroupBarrier();
+        smem[l] = v;
+        workgroupBarrier();
+    }
+
+    let excl = select(0u, smem[l - 1u], l > 0u);
+    if (l < ${sNBLK}) { blockBuf[l] = excl; }
+}
+`;
+
+    // ── 3.4  PREFIX-SUM PHASE 3 — add block offsets to local prefix sums ──────
+    //   Each workgroup reads its block's global offset and adds it to every
+    //   local prefix entry, completing the global exclusive prefix sum.
+    const SCAN3_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>        blockBuf : array<u32>;
+@group(0) @binding(1) var<storage, read_write>  prefBuf  : array<u32>;
+
+@compute @workgroup_size(${sWGS})
+fn cs_main(
+    @builtin(global_invocation_id) gid : vec3u,
+    @builtin(workgroup_id)         wid : vec3u
+) {
+    let g = gid.x;
+    if (g >= ${sNC}) { return; }
+    prefBuf[g] += blockBuf[wid.x];
+}
+`;
+
+    // ── 3.5  BUILD GRID ───────────────────────────────────────────────────────
+    //   Combines prefix (start index) + count into a single vec4f for each cell.
+    //   This lets the density / force shaders do a single buffer read per cell.
+    const BGRID_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>        cntBuf  : array<u32>;
+@group(0) @binding(1) var<storage, read>        preBuf  : array<u32>;
+@group(0) @binding(2) var<storage, read_write>  gridOut : array<vec4f>;
+
+@compute @workgroup_size(${sWGS})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let cell = gid.x;
+    if (cell >= ${sNC}) { return; }
+    gridOut[cell] = vec4f(f32(preBuf[cell]), f32(cntBuf[cell]), 0.0, 0.0);
+}
+`;
+
+    // ── 3.6  SCATTER ──────────────────────────────────────────────────────────
+    //   Uses atomicAdd on offsetBuf (initialised = copy of prefixBuf) to claim
+    //   a unique slot in sortedBuf for each particle.
+    //   CRITICAL: we write (pos.xyz, origId) into sortedBuf so that downstream
+    //   density / force shaders can read neighbour positions with LINEAR memory
+    //   access (particles are now ordered by spatial cell), eliminating the
+    //   original expensive random gather through originalId → posBuf[originalId].
+    const SCATTER_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>            posBuf   : array<vec4f>;
+@group(0) @binding(1) var<storage, read>            hashBuf  : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write>      offsets  : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write>      sortOut  : array<vec4f>;
+
+@compute @workgroup_size(${sWGP})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let id = gid.x;
+    if (id >= ${sN}) { return; }
+
+    let hd     = hashBuf[id];
+    let cellId = u32(hd.x);
+    // hd.y == f32(id) (original particle ID stored during initialisation)
+
+    let pos    = posBuf[id].xyz;
+    let slot   = atomicAdd(&offsets[cellId], 1u);
+    sortOut[slot] = vec4f(pos, f32(id));   // (x, y, z, originalId)
+}
+`;
+
+    // ── 3.7  DENSITY ──────────────────────────────────────────────────────────
+    //   27-cell neighbour search using Poly6 kernel.
+    //   Reads positions from sortedBuf (spatially ordered → better cache hits).
+    const DENSITY_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>            sortBuf  : array<vec4f>;
+@group(0) @binding(1) var<storage, read>            gridBuf  : array<vec4f>;
+@group(0) @binding(2) var<storage, read>            posBuf   : array<vec4f>;
+@group(0) @binding(3) var<storage, read_write>      denOut   : array<vec4f>;
+
+const WORLD_MAX : i32 = ${sWM};
+const WORLD_U   : u32 = ${sW};
+const Z_MULT_U  : u32 = ${sZM};
+const POLY6     : f32 = 315.0 / (64.0 * 3.14159265358979);
+
+fn cellIdx(c : vec3i) -> u32 {
+    let cl = clamp(c, vec3i(0), vec3i(WORLD_MAX));
+    return u32(cl.x) + u32(cl.y) * WORLD_U + u32(cl.z) * Z_MULT_U;
+}
+
+@compute @workgroup_size(${sWGP})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let id = gid.x;
+    if (id >= ${sN}) { return; }
+
+    let myPos  = posBuf[id].xyz;
+    let myCell = vec3i(floor(myPos));
+
+    var rho = 0.0;
+
+    for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+        let nc = myCell + vec3i(dx, dy, dz);
+        if (nc.x < 0 || nc.x > WORLD_MAX ||
+            nc.y < 0 || nc.y > WORLD_MAX ||
+            nc.z < 0 || nc.z > WORLD_MAX) { continue; }
+
+        let ci   = cellIdx(nc);
+        let gd   = gridBuf[ci];
+        let si   = i32(gd.x);
+        let cnt  = i32(gd.y);
+
+        for (var k = 0; k < cnt; k++) {
+            // sortBuf is cell-ordered → near-sequential access for typical SPH neighbourhoods
+            let nPos = sortBuf[si + k].xyz;
+            let r2   = dot(myPos - nPos, myPos - nPos);
+            if (r2 < 1.0) {
+                let w = 1.0 - r2;
+                rho  += POLY6 * w * w * w;
+            }
+        }
+    }}}
+
+    denOut[id] = vec4f(max(rho, 0.0001), 0.0, 0.0, 0.0);
+}
+`;
+
+    // ── 3.8  FORCE ────────────────────────────────────────────────────────────
+    //   Spiky pressure gradient + viscosity Laplacian + gravity.
+    //   Position lookup: sortBuf (sequential).
+    //   Velocity / density lookup: via originalId (unavoidable random access,
+    //   but only 2 random reads per neighbour instead of the 3 in the original).
+    const FORCE_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>            sortBuf  : array<vec4f>;
+@group(0) @binding(1) var<storage, read>            gridBuf  : array<vec4f>;
+@group(0) @binding(2) var<storage, read>            posBuf   : array<vec4f>;
+@group(0) @binding(3) var<storage, read>            velBuf   : array<vec4f>;
+@group(0) @binding(4) var<storage, read>            denBuf   : array<vec4f>;
+@group(0) @binding(5) var<storage, read_write>      velOut   : array<vec4f>;
+
+const WORLD_MAX   : i32 = ${sWM};
+const WORLD_U     : u32 = ${sW};
+const Z_MULT_U    : u32 = ${sZM};
+const WORLD_BOUND : f32 = ${sWB};
+
+const REST_DENSITY : f32 = 5.0;
+const STIFFNESS    : f32 = 150.0;
+const VISCOSITY    : f32 = 1.5;
+const DT           : f32 = 0.005;
+const SPIKY_GRAD   : f32 = -45.0 / 3.14159265358979;   // H=1
+const VISC_LAP     : f32 =  45.0 / 3.14159265358979;   // H=1
+const DAMPING      : f32 = 0.5;
+
+fn cellIdx(c : vec3i) -> u32 {
+    let cl = clamp(c, vec3i(0), vec3i(WORLD_MAX));
+    return u32(cl.x) + u32(cl.y) * WORLD_U + u32(cl.z) * Z_MULT_U;
+}
+
+@compute @workgroup_size(${sWGP})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let id = gid.x;
+    if (id >= ${sN}) { return; }
+
+    let myPos     = posBuf[id].xyz;
+    let myVel     = velBuf[id].xyz;
+    let myRho     = denBuf[id].x;
+    let myP       = STIFFNESS * (myRho - REST_DENSITY);
+    let myCell    = vec3i(floor(myPos));
+
+    var fPres     = vec3f(0.0);
+    var fVisc     = vec3f(0.0);
+
+    for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+        let nc = myCell + vec3i(dx, dy, dz);
+        if (nc.x < 0 || nc.x > WORLD_MAX ||
+            nc.y < 0 || nc.y > WORLD_MAX ||
+            nc.z < 0 || nc.z > WORLD_MAX) { continue; }
+
+        let ci   = cellIdx(nc);
+        let gd   = gridBuf[ci];
+        let si   = i32(gd.x);
+        let cnt  = i32(gd.y);
+
+        for (var k = 0; k < cnt; k++) {
+            let sData = sortBuf[si + k];
+            let nPos  = sData.xyz;               // sequential position read
+            let nId   = u32(sData.w);            // original index for vel/density
+
+            if (nId == id) { continue; }
+
+            let diff  = myPos - nPos;
+            let r     = length(diff);
+
+            if (r > 0.0 && r < 1.0) {
+                let dir   = diff / r;
+                let nRho  = denBuf[nId].x;
+                let nVel  = velBuf[nId].xyz;
+                let nP    = STIFFNESS * (nRho - REST_DENSITY);
+
+                let pT    = (myP + nP) / (2.0 * nRho);
+                fPres    += -dir * pT * SPIKY_GRAD * pow(1.0 - r, 2.0);
+
+                let vDiff = nVel - myVel;
+                fVisc    += VISCOSITY * (vDiff / nRho) * VISC_LAP * (1.0 - r);
+            }
+        }
+    }}}
+
+    let grav     = vec3f(0.0, -9.8, 0.0);
+    let totalF   = fPres + fVisc + grav;
+    var newVel   = myVel + (totalF / myRho) * DT;
+
+    // Wall bounce (same as original)
+    let nextPos  = myPos + newVel * DT;
+    if (nextPos.x < 0.0 || nextPos.x > WORLD_BOUND) { newVel.x *= -DAMPING; }
+    if (nextPos.y < 0.0 || nextPos.y > WORLD_BOUND) { newVel.y *= -DAMPING; }
+    if (nextPos.z < 0.0 || nextPos.z > WORLD_BOUND) { newVel.z *= -DAMPING; }
+
+    velOut[id] = vec4f(newVel, 0.0);
+}
+`;
+
+    // ── 3.9  INTEGRATE ────────────────────────────────────────────────────────
+    const INTEG_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read>            posBuf  : array<vec4f>;
+@group(0) @binding(1) var<storage, read>            velBuf  : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write>      posOut  : array<vec4f>;
+
+const DT          : f32 = 0.005;
+const WORLD_BOUND : f32 = ${sWB};
+
+@compute @workgroup_size(${sWGP})
+fn cs_main(@builtin(global_invocation_id) gid : vec3u) {
+    let id = gid.x;
+    if (id >= ${sN}) { return; }
+
+    let pd   = posBuf[id];
+    let pos  = pd.xyz;
+    let pid  = pd.w;
+    let vel  = velBuf[id].xyz;
+    var npos = clamp(pos + vel * DT, vec3f(0.01), vec3f(WORLD_BOUND));
+    posOut[id] = vec4f(npos, pid);
+}
+`;
+
+    // ── 3.10  RENDER VERTEX SHADER ────────────────────────────────────────────
+    //   Reads positions via storage buffer + vertex_index (no vertex buffer).
+    //   Identical camera/projection math to the reference implementations.
+    const RENDER_VS = /* wgsl */`
+struct Uniforms { aspect : f32 }
+@group(0) @binding(0) var<uniform>            uni    : Uniforms;
+@group(0) @binding(1) var<storage, read>      posBuf : array<vec4f>;
+
+const HALF_WORLD : f32 = ${sHW};
+
+struct VsOut {
+    @builtin(position) pos   : vec4f,
+    @location(0)       depth : f32,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vIdx : u32) -> VsOut {
+    let p    = posBuf[vIdx].xyz;
+    let c    = p - vec3f(HALF_WORLD);
+
+    let ry   = -0.785;
+    let cy   = cos(ry); let sy = sin(ry);
+    let rotY = mat3x3f( cy, 0.0, sy,   0.0, 1.0, 0.0,  -sy, 0.0, cy);
+
+    let rx   = -0.523;
+    let cx   = cos(rx); let sx = sin(rx);
+    let rotX = mat3x3f(1.0, 0.0, 0.0,   0.0, cx, -sx,   0.0, sx, cx);
+
+    let cam   = rotX * (rotY * c) - vec3f(0.0, 0.0, 60.0);
+    let w     = -cam.z;
+
+    var o : VsOut;
+    o.pos   = vec4f(cam.x / uni.aspect, cam.y, 0.0, w);
+    o.depth = cam.z;
+    return o;
+}
+`;
+
+    // ── 3.11  RENDER FRAGMENT SHADER ──────────────────────────────────────────
+    const RENDER_FS = /* wgsl */`
+@fragment
+fn fs_main(@location(0) depth : f32) -> @location(0) vec4f {
+    let df = clamp((depth + 90.0) / 60.0, 0.2, 1.0);
+    return vec4f(0.2*df, 0.6*df, df, 1.0);
+}
+`;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4.  SHADER MODULES
+    // ─────────────────────────────────────────────────────────────────────────
+    function mkMod(label, code) {
+        const m = device.createShaderModule({ label, code });
+        if (m.getCompilationInfo) {
+            m.getCompilationInfo().then(info => {
+                for (const msg of info.messages) {
+                    if (msg.type === 'error')
+                        console.error(`[${label}] line ${msg.lineNum}: ${msg.message}`);
+                }
+            });
+        }
+        return m;
+    }
+
+    const modHash     = mkMod('hash',     HASH_CS);
+    const modScan1    = mkMod('scan1',    SCAN1_CS);
+    const modScan2    = mkMod('scan2',    SCAN2_CS);
+    const modScan3    = mkMod('scan3',    SCAN3_CS);
+    const modBGrid    = mkMod('bgrid',    BGRID_CS);
+    const modScatter  = mkMod('scatter',  SCATTER_CS);
+    const modDensity  = mkMod('density',  DENSITY_CS);
+    const modForce    = mkMod('force',    FORCE_CS);
+    const modInteg    = mkMod('integ',    INTEG_CS);
+    const modRVS      = mkMod('render_vs',RENDER_VS);
+    const modRFS      = mkMod('render_fs',RENDER_FS);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5.  BIND GROUP LAYOUTS (BGLs)
+    //     We create fine-grained layouts so each pipeline has exactly the
+    //     bindings it needs — avoids over-wide BGLs that hurt some drivers.
+    // ─────────────────────────────────────────────────────────────────────────
+    function mkBGL(label, entries) {
+        return device.createBindGroupLayout({ label, entries });
+    }
+    function ro(binding) { return { binding, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'read-only-storage' } }; }
+    function rw(binding) { return { binding, visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: 'storage' } }; }
+    function un(binding, vis) { return { binding, visibility: vis,
+        buffer: { type: 'uniform' } }; }
+
+    const bglHash     = mkBGL('bgl-hash',    [ro(0), rw(1), rw(2)]);
+    const bglScan1    = mkBGL('bgl-scan1',   [ro(0), rw(1), rw(2)]);
+    const bglScan2    = mkBGL('bgl-scan2',   [rw(0)]);
+    const bglScan3    = mkBGL('bgl-scan3',   [ro(0), rw(1)]);
+    const bglBGrid    = mkBGL('bgl-bgrid',   [ro(0), ro(1), rw(2)]);
+    const bglScatter  = mkBGL('bgl-scatter', [ro(0), ro(1), rw(2), rw(3)]);
+    const bglDensity  = mkBGL('bgl-density', [ro(0), ro(1), ro(2), rw(3)]);
+    const bglForce    = mkBGL('bgl-force',   [ro(0), ro(1), ro(2), ro(3), ro(4), rw(5)]);
+    const bglInteg    = mkBGL('bgl-integ',   [ro(0), ro(1), rw(2)]);
+    const bglRender   = mkBGL('bgl-render',  [
+        un(0, GPUShaderStage.VERTEX),
+        { binding:1, visibility: GPUShaderStage.VERTEX, buffer:{ type:'read-only-storage' } }
+    ]);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6.  PIPELINES
+    // ─────────────────────────────────────────────────────────────────────────
+    function mkCP(label, mod, bgl) {
+        return device.createComputePipeline({
+            label,
+            layout: device.createPipelineLayout({ bindGroupLayouts:[bgl] }),
+            compute: { module: mod, entryPoint:'cs_main' },
+        });
+    }
+
+    const pipHash     = mkCP('pip-hash',    modHash,    bglHash);
+    const pipScan1    = mkCP('pip-scan1',   modScan1,   bglScan1);
+    const pipScan2    = mkCP('pip-scan2',   modScan2,   bglScan2);
+    const pipScan3    = mkCP('pip-scan3',   modScan3,   bglScan3);
+    const pipBGrid    = mkCP('pip-bgrid',   modBGrid,   bglBGrid);
+    const pipScatter  = mkCP('pip-scatter', modScatter, bglScatter);
+    const pipDensity  = mkCP('pip-density', modDensity, bglDensity);
+    const pipForce    = mkCP('pip-force',   modForce,   bglForce);
+    const pipInteg    = mkCP('pip-integ',   modInteg,   bglInteg);
+
+    const pipRender = device.createRenderPipeline({
+        label:  'pip-render',
+        layout:  device.createPipelineLayout({ bindGroupLayouts:[bglRender] }),
+        vertex:  { module:modRVS, entryPoint:'vs_main', buffers:[] },
+        fragment:{ module:modRFS, entryPoint:'fs_main', targets:[{ format:canvasFmt }] },
+        primitive:    { topology:'point-list' },
+        depthStencil: { format:'depth24plus', depthWriteEnabled:true, depthCompare:'less' },
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 7.  PRE-BAKED BIND GROUPS
+    //     All combinations of ping-pong state are pre-created once at init
+    //     time to eliminate per-frame BG allocation and GPU-side validation.
+    //     This is one of the largest API-overhead reductions available in WebGPU.
+    // ─────────────────────────────────────────────────────────────────────────
+    function mkBG(layout, entries) {
+        return device.createBindGroup({
+            layout,
+            entries: entries.map(([b, buf]) => ({ binding:b, resource:{ buffer:buf } }))
+        });
+    }
+
+    // Sort infrastructure – fixed buffers, no ping-pong dependency
+    const bgScan1  = mkBG(bglScan1,  [[0,countBuf],[1,prefixBuf],[2,blockBuf]]);
+    const bgScan2  = mkBG(bglScan2,  [[0,blockBuf]]);
+    const bgScan3  = mkBG(bglScan3,  [[0,blockBuf],[1,prefixBuf]]);
+    const bgBGrid  = mkBG(bglBGrid,  [[0,countBuf],[1,prefixBuf],[2,gridBuf]]);
+
+    // Physics – 2 variants per pass (one per ping-pong state)
+    const bgHashA     = mkBG(bglHash,    [[0,posBufA],[1,hashBuf],[2,countBuf]]);
+    const bgHashB     = mkBG(bglHash,    [[0,posBufB],[1,hashBuf],[2,countBuf]]);
+
+    const bgScatterA  = mkBG(bglScatter, [[0,posBufA],[1,hashBuf],[2,offsetBuf],[3,sortedBuf]]);
+    const bgScatterB  = mkBG(bglScatter, [[0,posBufB],[1,hashBuf],[2,offsetBuf],[3,sortedBuf]]);
+
+    const bgDensityA  = mkBG(bglDensity, [[0,sortedBuf],[1,gridBuf],[2,posBufA],[3,densityBuf]]);
+    const bgDensityB  = mkBG(bglDensity, [[0,sortedBuf],[1,gridBuf],[2,posBufB],[3,densityBuf]]);
+
+    // Force: reads readVel, writes writeVel
+    const bgForceA    = mkBG(bglForce,   [[0,sortedBuf],[1,gridBuf],[2,posBufA],[3,velBufA],[4,densityBuf],[5,velBufB]]);
+    const bgForceB    = mkBG(bglForce,   [[0,sortedBuf],[1,gridBuf],[2,posBufB],[3,velBufB],[4,densityBuf],[5,velBufA]]);
+
+    // Integrate: reads readPos + writeVel, writes writePos
+    const bgIntegA    = mkBG(bglInteg,   [[0,posBufA],[1,velBufB],[2,posBufB]]);
+    const bgIntegB    = mkBG(bglInteg,   [[0,posBufB],[1,velBufA],[2,posBufA]]);
+
+    const bgRenderA   = mkBG(bglRender,  [[0,aspectBuf],[1,posBufA]]);
+    const bgRenderB   = mkBG(bglRender,  [[0,aspectBuf],[1,posBufB]]);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8.  CORE SIMULATION STEP
+    //     All GPU work for one SPH step is packed into a SINGLE command encoder
+    //     submission.  The two compute passes are separated by a clearBuffer
+    //     (phase-1 sort infra) and a copyBufferToBuffer (scatter cursor init),
+    //     both of which are free GPU-DMA operations with no CPU involvement.
+    //
+    //     Pass count summary vs original bitonic approach:
+    //       Original: ~136 bitonic dispatches + scan + density + force + integ
+    //       Optimised: 8 dispatches + 1 clear + 1 copy
+    // ─────────────────────────────────────────────────────────────────────────
+    const WGCOUNT_P = Math.ceil(N      / WGP);
+    const WGCOUNT_C = Math.ceil(NCELLS / WGC);
+    const WGCOUNT_S = Math.ceil(NCELLS / WGS);   // same as WGCOUNT_C when WGC=WGS
+
+    function stepSimulation() {
+        const isA = readState.pos === posBufA;
+
+        const enc = device.createCommandEncoder({ label:'sim-step' });
+
+        // GPU-native memset — zeros countBuf in a single DMA command, no shader needed
+        enc.clearBuffer(countBuf, 0, C4);
+
+        // ── COMPUTE PASS 1: Sort infrastructure ──────────────────────────────
+        // All dispatches within a single beginComputePass…end() block.
+        // WebGPU guarantees ordered execution with implicit storage barriers
+        // between consecutive dispatches inside the same compute pass.
+        const cp1 = enc.beginComputePass({ label:'sort-pass' });
+
+        // 1. Hash + Atomic Count (merged)
+        cp1.setPipeline(pipHash);
+        cp1.setBindGroup(0, isA ? bgHashA : bgHashB);
+        cp1.dispatchWorkgroups(WGCOUNT_P);
+
+        // 2. Prefix-sum Phase 1 (local exclusive scan)
+        cp1.setPipeline(pipScan1);
+        cp1.setBindGroup(0, bgScan1);
+        cp1.dispatchWorkgroups(WGCOUNT_S);
+
+        // 3. Prefix-sum Phase 2 (single-workgroup block-sum scan)
+        cp1.setPipeline(pipScan2);
+        cp1.setBindGroup(0, bgScan2);
+        cp1.dispatchWorkgroups(1);   // always 1 workgroup — NBLOCKS ≤ WGS
+
+        // 4. Prefix-sum Phase 3 (add block offsets)
+        cp1.setPipeline(pipScan3);
+        cp1.setBindGroup(0, bgScan3);
+        cp1.dispatchWorkgroups(WGCOUNT_S);
+
+        // 5. Build grid lookup table (startIdx, count) per cell
+        cp1.setPipeline(pipBGrid);
+        cp1.setBindGroup(0, bgBGrid);
+        cp1.dispatchWorkgroups(WGCOUNT_C);
+
+        cp1.end();
+
+        // GPU-native buffer copy — initialises scatter write-cursors from the
+        // computed prefix-sum.  Equivalent to "offsetBuf = prefixBuf" with zero
+        // CPU involvement; the GPU's DMA engine handles it asynchronously.
+        enc.copyBufferToBuffer(prefixBuf, 0, offsetBuf, 0, C4);
+
+        // ── COMPUTE PASS 2: Physics ───────────────────────────────────────────
+        const cp2 = enc.beginComputePass({ label:'physics-pass' });
+
+        // 6. Scatter — place particles into sortedBuf (pos + origId) by cell
+        cp2.setPipeline(pipScatter);
+        cp2.setBindGroup(0, isA ? bgScatterA : bgScatterB);
+        cp2.dispatchWorkgroups(WGCOUNT_P);
+
+        // 7. Density — Poly6 kernel, reads from spatially sorted sortedBuf
+        cp2.setPipeline(pipDensity);
+        cp2.setBindGroup(0, isA ? bgDensityA : bgDensityB);
+        cp2.dispatchWorkgroups(WGCOUNT_P);
+
+        // 8. Force — pressure + viscosity + gravity
+        cp2.setPipeline(pipForce);
+        cp2.setBindGroup(0, isA ? bgForceA : bgForceB);
+        cp2.dispatchWorkgroups(WGCOUNT_P);
+
+        // 9. Integrate — Euler position update
+        cp2.setPipeline(pipInteg);
+        cp2.setBindGroup(0, isA ? bgIntegA : bgIntegB);
+        cp2.dispatchWorkgroups(WGCOUNT_P);
+
+        cp2.end();
+
+        // Single submit — all ~8 dispatches + 2 memory ops in one batch
+        device.queue.submit([enc.finish()]);
+
+        swapPingPong();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 9.  RENDER LOOP
+    // ─────────────────────────────────────────────────────────────────────────
+    let isRendering = false;
+    let animId      = null;
+
+    function renderLoop() {
+        if (!isRendering) return;
+
+        const steps = parseInt(document.getElementById('steps-input').value) || 1;
+        for (let i = 0; i < steps; i++) stepSimulation();
+
+        device.queue.writeBuffer(aspectBuf, 0,
+            new Float32Array([canvas.width / canvas.height, 0, 0, 0]));
+
+        const enc      = device.createCommandEncoder({ label:'render-frame' });
+        const colorView= gpuCtx.getCurrentTexture().createView();
+        const rp = enc.beginRenderPass({
+            colorAttachments:[{
+                view:       colorView,
+                clearValue: [0.05, 0.05, 0.05, 1.0],
+                loadOp:    'clear',
+                storeOp:   'store',
+            }],
+            depthStencilAttachment:{
+                view:             depthTex.createView(),
+                depthClearValue:  1.0,
+                depthLoadOp:     'clear',
+                depthStoreOp:    'discard',
+            },
+        });
+
+        rp.setPipeline(pipRender);
+        rp.setBindGroup(0, readState.pos === posBufA ? bgRenderA : bgRenderB);
+        rp.draw(N);
+        rp.end();
+
+        device.queue.submit([enc.finish()]);
+        animId = requestAnimationFrame(renderLoop);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 10.  GPU SYNC FENCE
+    //      Copies 16 bytes from the current read position buffer into a
+    //      MAP_READ buffer, then awaits the map.  This forces the GPU command
+    //      queue to flush, giving us a precise CPU-side end timestamp.
+    //      (Mirrors WebGL2's readPixels() sync trick.)
+    // ─────────────────────────────────────────────────────────────────────────
+    async function forceGpuSync() {
+        const enc = device.createCommandEncoder({ label:'sync' });
+        enc.copyBufferToBuffer(readState.pos, 0, syncBuf, 0, 16);
+        device.queue.submit([enc.finish()]);
+        await syncBuf.mapAsync(GPUMapMode.READ);
+        syncBuf.unmap();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 11.  HEADLESS BENCHMARK
+    //      Differential timing: (T60 − T10) eliminates the fixed sync overhead,
+    //      leaving a clean measurement of 50 steps of pure GPU compute.
+    //      Identical methodology to the reference WebGL2 / WebGPU files for
+    //      apples-to-apples comparison.
+    // ─────────────────────────────────────────────────────────────────────────
+    async function runBenchmark() {
+        isRendering = false;
+        if (animId) cancelAnimationFrame(animId);
+
+        statsDiv.innerText = `Running Benchmark…\n` +
+            `Mode: ${simMode}  |  Particles: ${N}\n` +
+            `Phase 1: Timing 10 steps (warm-up + sync overhead)…`;
+        await new Promise(r => setTimeout(r, 60));
+
+        const s10 = performance.now();
+        for (let i = 0; i < 10; i++) stepSimulation();
+        await forceGpuSync();
+        const t10 = performance.now() - s10;
+
+        statsDiv.innerText = statsDiv.innerText + '\nPhase 2: Timing 60 steps…';
+        await new Promise(r => setTimeout(r, 60));
+
+        const s60 = performance.now();
+        for (let i = 0; i < 60; i++) stepSimulation();
+        await forceGpuSync();
+        const t60 = performance.now() - s60;
+
+        // Differential maths — removes fixed sync/driver overhead
+        const pure50    = t60 - t10;
+        const perStep   = pure50 / 50;
+        const overhead  = t10 - perStep * 10;
+        const sps       = 50 / (pure50 / 1000);
+
+        statsDiv.innerText =
+`─── WebGPU Optimised Benchmark Complete ───
+Particles : ${N.toLocaleString()}
+Sort      : GPU Counting Sort (O(n))
+           vs Bitonic Sort (O(n log²n))
+
+[Raw Measurements]
+T10 (10 steps + sync) : ${t10.toFixed(2)} ms
+T60 (60 steps + sync) : ${t60.toFixed(2)} ms
+
+[Differential Analysis]
+Pure GPU time (50 steps) = T60 − T10
+                         = ${t60.toFixed(2)} − ${t10.toFixed(2)}
+                         = ${pure50.toFixed(2)} ms
+
+[Derived Metrics]
+Time per step (compute+JS) : ${perStep.toFixed(2)} ms
+Fixed sync/driver overhead : ${overhead.toFixed(2)} ms
+Throughput                 : ${sps.toFixed(1)} SPS`;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 12.  TRIGGER
+    // ─────────────────────────────────────────────────────────────────────────
+    if (isRenderMode) {
+        isRendering = true;
+        statsDiv.innerText = `Render Mode — ${N.toLocaleString()} particles\n` +
+                             `Counting sort active. GPU atomics flying.`;
+        renderLoop();
+    } else {
+        runBenchmark();
+    }
+
+    console.log(`WebGPU Optimised Pipeline ready. N=${N}, NCELLS=${NCELLS}, NBLOCKS=${NBLOCKS}`);
+
+} // ← closes buildPipelineAndStart()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13.  UI EVENT LISTENERS
+// ─────────────────────────────────────────────────────────────────────────────
+document.getElementById('btn-low').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Already running — refresh to change mode.');
+    simMode = 'low';
+    statsDiv.innerText = 'Mode: Low (16k, 32³) selected.\nPress Start.';
+});
+document.getElementById('btn-high').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Already running — refresh to change mode.');
+    simMode = 'high';
+    statsDiv.innerText = 'Mode: High (65k, 32³) selected.\nPress Start.';
+});
+document.getElementById('btn-low-small').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Already running — refresh to change mode.');
+    simMode = 'low_small';
+    statsDiv.innerText = 'Mode: Low Small (16k, 16³) selected.\nPress Start.';
+});
+document.getElementById('btn-render').addEventListener('click', () => {
+    buildPipelineAndStart(true).catch(e => {
+        statsDiv.innerText = 'ERROR: ' + e.message;
+        console.error(e);
+    });
+});
+document.getElementById('btn-headless').addEventListener('click', () => {
+    buildPipelineAndStart(false).catch(e => {
+        statsDiv.innerText = 'ERROR: ' + e.message;
+        console.error(e);
+    });
+});
+
+statsDiv.innerText = 'WebGPU Optimised SPH\nMode: Low (16k) default.\nSelect mode then press Start.';
+</script>
+</body>
+</html>
